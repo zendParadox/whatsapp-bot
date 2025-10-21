@@ -12,24 +12,32 @@ import (
 	"os/signal"
 	"syscall"
 
+	_ "net/http/pprof"
+
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal/v3"
+
+	"time"
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
-	// "go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
-var NEXTJS_WEBHOOK_URL = os.Getenv("NEXTJS_WEBHOOK_URL")
+var httpClient = &http.Client{
+    // Anda bisa mengatur Timeout di sini untuk menghindari request yang menggantung
+    Timeout: 15 * time.Second, 
+}
+// var NEXTJS_WEBHOOK_URL = os.Getenv("NEXTJS_WEBHOOK_URL")
+var NEXTJS_WEBHOOK_URL string
 
 type WhatsAppClient struct {
 	Client *whatsmeow.Client
 }
+var DB_PATH string
 
-// eventHandler sekarang memiliki kemampuan untuk mengirim balasan
 func (wh *WhatsAppClient) eventHandler(evt interface{}) {
 	switch v := evt.(type) {
 	case *events.Message:
@@ -42,15 +50,12 @@ func (wh *WhatsAppClient) eventHandler(evt interface{}) {
 		message := v.Message.GetConversation()
 		fmt.Printf("Pesan diterima dari %s: %s\n", sender, message)
 
-		// Kirim data ke webhook dan dapatkan pesan balasan
 		replyMessage, err := sendToWebhook(sender, message)
 		if err != nil {
 			log.Printf("Gagal memproses via webhook: %v\n", err)
-			// Kirim pesan error umum jika webhook gagal
 			replyMessage = "Maaf, terjadi kesalahan di server. Coba lagi nanti."
 		}
 
-		// Jika ada pesan balasan dari API, kirim kembali ke pengguna
 		if replyMessage != "" {
 			_, err := wh.Client.SendMessage(context.Background(), senderJID, &waProto.Message{
 				Conversation: &replyMessage,
@@ -64,12 +69,12 @@ func (wh *WhatsAppClient) eventHandler(evt interface{}) {
 	}
 }
 
-// sendToWebhook sekarang mengembalikan pesan balasan dari API
 func sendToWebhook(sender, message string) (string, error) {
-	if NEXTJS_WEBHOOK_URL == "" {
-		NEXTJS_WEBHOOK_URL = "http://localhost:3000/api/whatsapp-webhook"
-		fmt.Println("PERINGATAN: NEXTJS_WEBHOOK_URL tidak diset, menggunakan default localhost.")
-	}
+	// if NEXTJS_WEBHOOK_URL == "" {
+	// 	// NEXTJS_WEBHOOK_URL = "https://fe-whatsapp-bot.vercel.app/api/whatsapp-webhook"
+	// 	NEXTJS_WEBHOOK_URL = "http://localhost:3000/api/whatsapp-webhook"
+	// 	fmt.Println("PERINGATAN: NEXTJS_WEBHOOK_URL tidak diset, menggunakan default localhost.")
+	// }
 	payload := map[string]string{
 		"sender":  sender,
 		"message": message,
@@ -79,7 +84,7 @@ func sendToWebhook(sender, message string) (string, error) {
 		return "", fmt.Errorf("error marshalling payload: %w", err)
 	}
 
-	resp, err := http.Post(NEXTJS_WEBHOOK_URL, "application/json", bytes.NewBuffer(jsonPayload))
+	resp, err := httpClient.Post(NEXTJS_WEBHOOK_URL, "application/json", bytes.NewBuffer(jsonPayload))
 	if err != nil {
 		return "", fmt.Errorf("error sending request to webhook: %w", err)
 	}
@@ -89,7 +94,6 @@ func sendToWebhook(sender, message string) (string, error) {
 		return "", fmt.Errorf("webhook returned non-200 status code: %d", resp.StatusCode)
 	}
 
-	// Baca dan parse pesan balasan dari body respons
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("error reading response body: %w", err)
@@ -104,10 +108,28 @@ func sendToWebhook(sender, message string) (string, error) {
 	return responseBody["message"], nil
 }
 
-func main() {
-	dbLog := waLog.Stdout("Database", "INFO", true)
+func init() {
+    NEXTJS_WEBHOOK_URL = os.Getenv("NEXTJS_WEBHOOK_URL")
+    if NEXTJS_WEBHOOK_URL == "" {
+        NEXTJS_WEBHOOK_URL = "https://fe-whatsapp-bot.vercel.app/api/whatsapp-webhook"
+        fmt.Println("PERINGATAN: NEXTJS_WEBHOOK_URL tidak diset, menggunakan default:", NEXTJS_WEBHOOK_URL)
+    } else {
+        fmt.Println("NEXTJS_WEBHOOK_URL =", NEXTJS_WEBHOOK_URL)
+    }
 
-	dbPath := "wa-session.db"
+    DB_PATH = os.Getenv("DB_PATH")
+    if DB_PATH == "" {
+        DB_PATH = "wa-session.db" // default relative (tapi sebaiknya set absolute via env)
+        fmt.Println("PERINGATAN: DB_PATH tidak diset, menggunakan default:", DB_PATH)
+    } else {
+        fmt.Println("DB_PATH =", DB_PATH)
+    }
+}
+
+func main() {
+	dbLog := waLog.Stdout("Database", "WARN", true)
+
+	dbPath := "/www/whatsapp-bot/wa-session.db"
 
 	container, err := sqlstore.New(context.Background(), "sqlite3", fmt.Sprintf("file:%s?_foreign_keys=on", dbPath), dbLog)
 	if err != nil {
@@ -119,11 +141,16 @@ func main() {
 		panic(err)
 	}
 
-	clientLog := waLog.Stdout("Client", "INFO", true)
+	clientLog := waLog.Stdout("Client", "WARN", true)
 	client := whatsmeow.NewClient(deviceStore, clientLog)
 
 	wh := &WhatsAppClient{Client: client}
 	client.AddEventHandler(wh.eventHandler)
+
+	go func() {
+        fmt.Println("Server pprof berjalan di http://localhost:6060/debug/pprof/")
+        log.Println(http.ListenAndServe("localhost:6060", nil))
+    }()
 
 	if client.Store.ID == nil {
 		qrChan, _ := client.GetQRChannel(context.Background())
@@ -134,7 +161,14 @@ func main() {
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				fmt.Println("QR code diterima, scan dengan ponsel Anda:")
-				qrterminal.Generate(evt.Code, qrterminal.L, os.Stdout)
+
+				config := qrterminal.Config{
+					Level:      qrterminal.L,
+					Writer:     os.Stdout,
+					HalfBlocks: true,
+				}
+				qrterminal.GenerateWithConfig(evt.Code, config)
+
 				fmt.Println("Silakan scan QR code di atas untuk login.")
 			} else {
 				fmt.Println("Event login:", evt.Event)
