@@ -11,10 +11,12 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"path/filepath"
+	
 
 	_ "net/http/pprof"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 	"github.com/mdp/qrterminal/v3"
 
 	"time"
@@ -46,6 +48,8 @@ func (wh *WhatsAppClient) eventHandler(evt interface{}) {
 		}
 
 		senderJID := v.Info.Sender
+		// Gunakan ToNonAD() untuk mendapatkan JID tanpa device part
+		recipientJID := senderJID.ToNonAD()
 		sender := senderJID.String()
 		message := v.Message.GetConversation()
 		fmt.Printf("Pesan diterima dari %s: %s\n", sender, message)
@@ -57,7 +61,7 @@ func (wh *WhatsAppClient) eventHandler(evt interface{}) {
 		}
 
 		if replyMessage != "" {
-			_, err := wh.Client.SendMessage(context.Background(), senderJID, &waProto.Message{
+			_, err := wh.Client.SendMessage(context.Background(), recipientJID, &waProto.Message{
 				Conversation: &replyMessage,
 			})
 			if err != nil {
@@ -111,7 +115,8 @@ func sendToWebhook(sender, message string) (string, error) {
 func init() {
     NEXTJS_WEBHOOK_URL = os.Getenv("NEXTJS_WEBHOOK_URL")
     if NEXTJS_WEBHOOK_URL == "" {
-        NEXTJS_WEBHOOK_URL = "https://fe-whatsapp-bot.vercel.app/api/whatsapp-webhook"
+        // NEXTJS_WEBHOOK_URL = "https://fe-whatsapp-bot.vercel.app/api/whatsapp-webhook"
+        NEXTJS_WEBHOOK_URL = "https://gotek.vercel.app/api/whatsapp-webhook"
         fmt.Println("PERINGATAN: NEXTJS_WEBHOOK_URL tidak diset, menggunakan default:", NEXTJS_WEBHOOK_URL)
     } else {
         fmt.Println("NEXTJS_WEBHOOK_URL =", NEXTJS_WEBHOOK_URL)
@@ -129,16 +134,51 @@ func init() {
 func main() {
 	dbLog := waLog.Stdout("Database", "WARN", true)
 
-	dbPath := "/www/whatsapp-bot/wa-session.db"
+	// gunakan env DB_PATH jika ada, kalau tidak pakai nilai dari init()/default
+	dbPath := DB_PATH
+	if dbPath == "" {
+		log.Fatal("DB_PATH kosong — set environment variable DB_PATH ke path sqlite (contoh: C:\\data\\wa-session.db atau /var/www/wa-session.db)")
+	}
 
-	container, err := sqlstore.New(context.Background(), "sqlite3", fmt.Sprintf("file:%s?_foreign_keys=on", dbPath), dbLog)
+	// jika path relatif terdeteksi, ubah ke absolute agar konsisten
+	if !filepath.IsAbs(dbPath) {
+		abs, err := filepath.Abs(dbPath)
+		if err == nil {
+			dbPath = abs
+		}
+	}
+
+	// pastikan folder ada
+	dbDir := filepath.Dir(dbPath)
+	if _, err := os.Stat(dbDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(dbDir, 0755); err != nil {
+			log.Fatalf("Gagal membuat direktori %s: %v", dbDir, err)
+		}
+	}
+
+	// jika file belum ada, buat file kosong agar sqlite bisa buka
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		f, err := os.Create(dbPath)
+		if err != nil {
+			log.Fatalf("Gagal membuat file DB %s: %v", dbPath, err)
+		}
+		f.Close()
+	}
+
+	// sqlite DSN: pakai file:path?param=.. ; di Windows backslash tidak perlu di-escape khusus karena kita pakai filepath
+	// modernc.org/sqlite menggunakan _pragma untuk set foreign_keys dan busy_timeout
+	// busy_timeout=5000 = tunggu 5 detik jika database locked sebelum error
+	dsn := fmt.Sprintf("file:%s?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", dbPath)
+
+	container, err := sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
 	if err != nil {
-		panic(err)
+		log.Fatalf("sqlstore.New error: %v\nDSN=%s", err, dsn)
 	}
 
 	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
-		panic(err)
+		// tidak langsung panic — beri pesan yang jelas
+		log.Fatalf("GetFirstDevice error: %v\nPastikan session sebelumnya tersimpan di DB atau jalankan flow QR login.", err)
 	}
 
 	clientLog := waLog.Stdout("Client", "WARN", true)
@@ -148,27 +188,29 @@ func main() {
 	client.AddEventHandler(wh.eventHandler)
 
 	go func() {
-        fmt.Println("Server pprof berjalan di http://localhost:6060/debug/pprof/")
-        log.Println(http.ListenAndServe("localhost:6060", nil))
-    }()
+		fmt.Println("Server pprof berjalan di http://localhost:6060/debug/pprof/")
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
+
+	// Connect / login handling
+	if client.Store == nil {
+		log.Fatalf("client.Store == nil, tidak bisa melanjutkan")
+	}
 
 	if client.Store.ID == nil {
 		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			panic(err)
+		if err := client.Connect(); err != nil {
+			log.Fatalf("client.Connect (first-time) error: %v", err)
 		}
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				fmt.Println("QR code diterima, scan dengan ponsel Anda:")
-
 				config := qrterminal.Config{
 					Level:      qrterminal.L,
 					Writer:     os.Stdout,
 					HalfBlocks: true,
 				}
 				qrterminal.GenerateWithConfig(evt.Code, config)
-
 				fmt.Println("Silakan scan QR code di atas untuk login.")
 			} else {
 				fmt.Println("Event login:", evt.Event)
@@ -176,9 +218,8 @@ func main() {
 		}
 	} else {
 		fmt.Println("Sesi ditemukan, mencoba menghubungkan kembali...")
-		err = client.Connect()
-		if err != nil {
-			panic(err)
+		if err := client.Connect(); err != nil {
+			log.Fatalf("client.Connect (reconnect) error: %v", err)
 		}
 	}
 
@@ -190,4 +231,5 @@ func main() {
 
 	client.Disconnect()
 }
+
 
