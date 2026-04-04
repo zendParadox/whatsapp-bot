@@ -783,10 +783,6 @@ func (h *Handler) setupHTTPServer() *http.ServeMux {
 	return mux
 }
 
-// ─────────────────────────────────────────────
-// Main
-// ─────────────────────────────────────────────
-
 func main() {
 	cfg := LoadConfig()
 
