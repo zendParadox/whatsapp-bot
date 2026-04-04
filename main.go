@@ -788,7 +788,6 @@ func main() {
 
 	m := newMetrics()
 
-	// Background: update uptime setiap 15 detik
 	go func() {
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
