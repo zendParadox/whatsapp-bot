@@ -31,7 +31,7 @@ jobs:
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
 
-      - name: Deploy - Stop service
+      - name: Deploy - Stop service & prepare
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -41,9 +41,10 @@ jobs:
           script: |
             echo "⏹️ Stopping service..."
             sudo systemctl stop whatsapp-bot
-            echo "✅ Service stopped"
+            rm -f /tmp/whatsapp-bot-linux
+            echo "✅ Ready for upload"
 
-      - name: Deploy - Upload binary
+      - name: Deploy - Upload binary to temp
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -51,10 +52,10 @@ jobs:
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT }}
           source: "whatsapp-bot-linux"
-          target: "/www/opt/whatsapp-bot/"
+          target: "/tmp/"
           overwrite: true
 
-      - name: Deploy - Start service
+      - name: Deploy - Move binary & start service
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -62,7 +63,8 @@ jobs:
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT }}
           script: |
-            chmod +x /www/opt/whatsapp-bot/whatsapp-bot-linux
+            sudo mv /tmp/whatsapp-bot-linux /www/opt/whatsapp-bot-docker/whatsapp-bot-linux
+            sudo chmod +x /www/opt/whatsapp-bot-docker/whatsapp-bot-linux
             sudo systemctl start whatsapp-bot
             sleep 2
             sudo systemctl status whatsapp-bot
