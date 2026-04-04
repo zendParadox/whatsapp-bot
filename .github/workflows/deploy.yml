@@ -26,7 +26,12 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o whatsapp-bot-linux main.go
           ls -lh whatsapp-bot-linux
 
-      - name: Deploy to server via SSH
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: Deploy - Stop service
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -38,7 +43,7 @@ jobs:
             sudo systemctl stop whatsapp-bot
             echo "✅ Service stopped"
 
-      - name: Upload binary via SCP
+      - name: Deploy - Upload binary
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -49,7 +54,7 @@ jobs:
           target: "/www/opt/whatsapp-bot/"
           overwrite: true
 
-      - name: Restart service via SSH
+      - name: Deploy - Start service
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -57,9 +62,7 @@ jobs:
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT }}
           script: |
-            echo "🔧 Setting permissions..."
             chmod +x /www/opt/whatsapp-bot/whatsapp-bot-linux
-            echo "🚀 Starting service..."
             sudo systemctl start whatsapp-bot
             sleep 2
             sudo systemctl status whatsapp-bot

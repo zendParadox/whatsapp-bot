@@ -786,7 +786,6 @@ func (h *Handler) setupHTTPServer() *http.ServeMux {
 func main() {
 	cfg := LoadConfig()
 
-	// Init Prometheus metrics
 	m := newMetrics()
 
 	// Background: update uptime setiap 15 detik
