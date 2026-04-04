@@ -1,6 +1,6 @@
 services:
   whatsapp-bot:
-    image: ghcr.io/zendparadox/whatsapp-bot:latest
+    build: .
     container_name: whatsapp-bot
     restart: unless-stopped
     ports:
@@ -16,20 +16,6 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-
-  # Watchtower: otomatis cek & pull image baru setiap 5 menit
-  watchtower:
-    image: containrrr/watchtower
-    container_name: watchtower
-    restart: unless-stopped
-    environment:
-      - WATCHTOWER_CLEANUP=true
-      - WATCHTOWER_POLL_INTERVAL=300
-      - WATCHTOWER_LABEL_ENABLE=false
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      # Login config untuk GHCR (private repo)
-      - ~/.docker/config.json:/config.json:ro
 
 volumes:
   wa-data:
