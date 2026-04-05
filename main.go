@@ -828,7 +828,6 @@ func main() {
 	}
 	client.AddEventHandler(h.eventHandler)
 
-	// Set initial connection state
 	m.WAConnected.Set(0)
 
 	if client.Store.ID == nil {
