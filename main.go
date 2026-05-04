@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 
+	"google.golang.org/protobuf/encoding/protojson"
+
 	"github.com/mdp/qrterminal/v3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -501,6 +503,18 @@ func (h *Handler) eventHandler(evt interface{}) {
 			}
 		}
 		if message == "" {
+			// Deep debug: dump the raw protobuf message to see what fields Meta AI actually uses
+			jsonOpts := protojson.MarshalOptions{Multiline: true, EmitUnpopulated: false}
+			if rawJSON, err := jsonOpts.Marshal(v.Message); err == nil {
+				// Truncate to 2000 chars to avoid flooding logs
+				dump := string(rawJSON)
+				if len(dump) > 2000 {
+					dump = dump[:2000] + "...(truncated)"
+				}
+				fmt.Printf("🔬 RAW MESSAGE DUMP from %s:\n%s\n", v.Info.Sender.User, dump)
+			} else {
+				fmt.Printf("🔬 RAW MESSAGE DUMP failed: %v\n", err)
+			}
 			fmt.Printf("⚠️ Pesan diterima tapi tidak bisa di-extract dari %s. MessageType: %T\n",
 				v.Info.Sender.User, v.Message)
 			return
