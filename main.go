@@ -345,111 +345,119 @@ func (h *Handler) eventHandler(evt interface{}) {
 			return
 		}
 
-		// === Handle Meta AI Bot streaming responses ===
-		// Meta AI sends responses as ProtocolMessage(MESSAGE_EDIT) with richResponseMessage inside.
-		// It streams by editing the same message multiple times (same botResponseID, growing text).
-		// We debounce: wait 2s after last edit before processing the final complete text.
-		if proto := v.Message.GetProtocolMessage(); proto != nil {
-			if proto.GetType() == 14 { // MESSAGE_EDIT = 14
-				if editedMsg := proto.GetEditedMessage(); editedMsg != nil {
-					if richResp := editedMsg.GetRichResponseMessage(); richResp != nil {
-						// Extract text from submessages
-						var textParts []string
-						for _, sub := range richResp.GetSubmessages() {
-							if txt := sub.GetMessageText(); txt != "" {
-								textParts = append(textParts, txt)
-							}
-						}
-						if len(textParts) == 0 {
-							return
-						}
-						fullText := strings.Join(textParts, "\n")
-
-						// Get botResponseID for deduplication
-						botResponseID := ""
-						if mci := v.Message.GetMessageContextInfo(); mci != nil {
-							if bm := mci.GetBotMetadata(); bm != nil {
-								botResponseID = bm.GetBotResponseID()
-							}
-						}
-						if botResponseID == "" {
-							botResponseID = fmt.Sprintf("unknown-%d", time.Now().UnixNano())
-						}
-
-						recipientJID := v.Info.Chat.ToNonAD()
-						chatString := v.Info.Chat.ToNonAD().String()
-						senderString := v.Info.Sender.ToNonAD().String()
-						if senderString == "" || senderString == "unknown@s.whatsapp.net" {
-							senderString = chatString
-						}
-
-						fmt.Printf("🤖 [META AI STREAM] botResponseID=%s text=\"%s\"\n", botResponseID, fullText)
-
-						// Debounce: update stored text and reset 2s timer
-						h.botResponseMu.Lock()
-						h.botResponseTexts[botResponseID] = fullText
-						if existingTimer, ok := h.botResponseTimers[botResponseID]; ok {
-							existingTimer.Stop()
-						}
-						h.botResponseTimers[botResponseID] = time.AfterFunc(2*time.Second, func() {
-							h.botResponseMu.Lock()
-							finalText := h.botResponseTexts[botResponseID]
-							delete(h.botResponseTexts, botResponseID)
-							delete(h.botResponseTimers, botResponseID)
-							h.botResponseMu.Unlock()
-
-							fmt.Printf("🤖 [META AI FINAL] botResponseID=%s text=\"%s\"\n", botResponseID, finalText)
-							h.Metrics.MessagesReceived.WithLabelValues("private", "meta_ai").Inc()
-							h.Metrics.LastMsgReceivedTimestamp.SetToCurrentTime()
-
-							// Forward the Meta AI response to webhook
-							replyMessage, err := h.sendToWebhook(senderString, chatString, finalText)
-							if err != nil {
-								log.Printf("❌ Gagal memproses Meta AI response via webhook: %v\n", err)
-								replyMessage = "Maaf, terjadi kesalahan saat memproses respons AI. Coba lagi nanti."
-							}
-
-							if replyMessage != "" {
-								_, err := h.Client.SendMessage(context.Background(), recipientJID, &waProto.Message{
-									Conversation: &replyMessage,
-								})
-								if err != nil {
-									log.Printf("❌ Gagal mengirim balasan Meta AI: %v", err)
-									h.Metrics.MessagesSent.WithLabelValues("error").Inc()
-								} else {
-									fmt.Printf("✅ Balasan Meta AI terkirim ke %s\n", senderString)
-									h.Metrics.MessagesSent.WithLabelValues("success").Inc()
-									h.Metrics.LastMsgSentTimestamp.SetToCurrentTime()
-								}
-							}
-						})
-						h.botResponseMu.Unlock()
-						return
-					}
-				}
-			}
-		}
-
-		// === Handle Meta AI placeholder messages (messageContextInfo-only, no content) ===
-		if mci := v.Message.GetMessageContextInfo(); mci != nil {
-			if bm := mci.GetBotMetadata(); bm != nil {
-				// This is a bot placeholder/metadata message with no extractable content, skip it silently
-				if v.Message.GetConversation() == "" &&
-					v.Message.GetExtendedTextMessage() == nil &&
-					v.Message.GetProtocolMessage() == nil &&
-					v.Message.GetRichResponseMessage() == nil {
-					fmt.Printf("🤖 [META AI] Skipping bot placeholder message (botResponseID=%s)\n", bm.GetBotResponseID())
-					return
-				}
-			}
-		}
-
 		recipientJID := v.Info.Chat.ToNonAD()
 		chatString := v.Info.Chat.ToNonAD().String()
 		senderString := v.Info.Sender.ToNonAD().String()
 		if senderString == "" || senderString == "unknown@s.whatsapp.net" {
 			senderString = chatString
 		}
+
+		// === Handle Meta AI / Bot messages ===
+		// Meta AI sends both standard messages and ProtocolMessage(MESSAGE_EDIT) streams.
+		// It can use richResponseMessage or extendedTextMessage.
+		// We intercept ANY message from a bot or with botMetadata, extract text, and debounce it.
+		botResponseID := ""
+		if mci := v.Message.GetMessageContextInfo(); mci != nil {
+			if bm := mci.GetBotMetadata(); bm != nil {
+				botResponseID = bm.GetBotResponseID()
+			}
+		}
+		isBot := strings.Contains(senderString, "@bot") || botResponseID != ""
+		
+		if isBot {
+			if botResponseID == "" {
+				// Use message ID as fallback for non-streaming bot messages
+				botResponseID = v.Info.ID 
+			}
+
+			fullText := ""
+
+			// 1. Try to extract from ProtocolMessage(MESSAGE_EDIT)
+			if proto := v.Message.GetProtocolMessage(); proto != nil && proto.GetType() == 14 {
+				if editedMsg := proto.GetEditedMessage(); editedMsg != nil {
+					if richResp := editedMsg.GetRichResponseMessage(); richResp != nil {
+						var textParts []string
+						for _, sub := range richResp.GetSubmessages() {
+							if txt := sub.GetMessageText(); txt != "" {
+								textParts = append(textParts, txt)
+							}
+						}
+						fullText = strings.Join(textParts, "\n")
+					} else if ext := editedMsg.GetExtendedTextMessage(); ext != nil {
+						fullText = ext.GetText()
+					} else if conv := editedMsg.GetConversation(); conv != "" {
+						fullText = conv
+					}
+				}
+			}
+
+			// 2. Try to extract from direct message
+			if fullText == "" {
+				if richResp := v.Message.GetRichResponseMessage(); richResp != nil {
+					var textParts []string
+					for _, sub := range richResp.GetSubmessages() {
+						if txt := sub.GetMessageText(); txt != "" {
+							textParts = append(textParts, txt)
+						}
+					}
+					fullText = strings.Join(textParts, "\n")
+				} else if ext := v.Message.GetExtendedTextMessage(); ext != nil {
+					fullText = ext.GetText()
+				} else if conv := v.Message.GetConversation(); conv != "" {
+					fullText = conv
+				}
+			}
+
+			if fullText == "" {
+				// Empty or placeholder bot message, ignore
+				return
+			}
+
+			fmt.Printf("🤖 [META AI STREAM] botResponseID=%s text=\"%s\"\n", botResponseID, fullText)
+
+			// Debounce: update stored text and reset 2s timer
+			h.botResponseMu.Lock()
+			h.botResponseTexts[botResponseID] = fullText
+			if existingTimer, ok := h.botResponseTimers[botResponseID]; ok {
+				existingTimer.Stop()
+			}
+			h.botResponseTimers[botResponseID] = time.AfterFunc(2*time.Second, func() {
+				h.botResponseMu.Lock()
+				finalText := h.botResponseTexts[botResponseID]
+				delete(h.botResponseTexts, botResponseID)
+				delete(h.botResponseTimers, botResponseID)
+				h.botResponseMu.Unlock()
+
+				fmt.Printf("🤖 [META AI FINAL] botResponseID=%s text=\"%s\"\n", botResponseID, finalText)
+				h.Metrics.MessagesReceived.WithLabelValues("private", "meta_ai").Inc()
+				h.Metrics.LastMsgReceivedTimestamp.SetToCurrentTime()
+
+				// Forward the Meta AI response to webhook
+				replyMessage, err := h.sendToWebhook(senderString, chatString, finalText)
+				if err != nil {
+					log.Printf("❌ Gagal memproses Meta AI response via webhook: %v\n", err)
+					replyMessage = "Maaf, terjadi kesalahan saat memproses respons AI. Coba lagi nanti."
+				}
+
+				if replyMessage != "" {
+					_, err := h.Client.SendMessage(context.Background(), recipientJID, &waProto.Message{
+						Conversation: &replyMessage,
+					})
+					if err != nil {
+						log.Printf("❌ Gagal mengirim balasan Meta AI: %v", err)
+						h.Metrics.MessagesSent.WithLabelValues("error").Inc()
+					} else {
+						fmt.Printf("✅ Balasan Meta AI terkirim ke %s\n", senderString)
+						h.Metrics.MessagesSent.WithLabelValues("success").Inc()
+						h.Metrics.LastMsgSentTimestamp.SetToCurrentTime()
+					}
+				}
+			})
+			h.botResponseMu.Unlock()
+			return
+		}
+
+
 
 		// Track unique senders
 		if _, loaded := h.seenSenders.LoadOrStore(senderString, true); !loaded {
@@ -674,9 +682,10 @@ func (h *Handler) sendToWebhook(sender, chatId, message string) (string, error) 
 	start := time.Now()
 
 	payload := map[string]string{
-		"sender":  sender,
-		"chat_id": chatId,
-		"message": message,
+		"sender":    sender,
+		"chat_id":   chatId,
+		"message":   message,
+		"bot_phone": h.Client.Store.ID.User,
 	}
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
