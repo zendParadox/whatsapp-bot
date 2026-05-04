@@ -375,6 +375,32 @@ func (h *Handler) eventHandler(evt interface{}) {
 				msg = inner
 			}
 		}
+		// Unwrap Meta AI / Bot messages (BotInvokeMessage, BotTaskMessage, BotForwardedMessage)
+		if botInvoke := msg.GetBotInvokeMessage(); botInvoke != nil {
+			if inner := botInvoke.GetMessage(); inner != nil {
+				fmt.Printf("🤖 Unwrapped BotInvokeMessage from %s\n", senderString)
+				msg = inner
+			}
+		}
+		if botTask := msg.GetBotTaskMessage(); botTask != nil {
+			if inner := botTask.GetMessage(); inner != nil {
+				fmt.Printf("🤖 Unwrapped BotTaskMessage from %s\n", senderString)
+				msg = inner
+			}
+		}
+		if botForwarded := msg.GetBotForwardedMessage(); botForwarded != nil {
+			if inner := botForwarded.GetMessage(); inner != nil {
+				fmt.Printf("🤖 Unwrapped BotForwardedMessage from %s\n", senderString)
+				msg = inner
+			}
+		}
+		// Unwrap edited messages
+		if edited := msg.GetEditedMessage(); edited != nil {
+			if inner := edited.GetMessage(); inner != nil {
+				fmt.Printf("✏️ Unwrapped EditedMessage from %s\n", senderString)
+				msg = inner
+			}
+		}
 
 		// === Handle Image Messages ===
 		if imgMsg := msg.GetImageMessage(); imgMsg != nil {
@@ -442,7 +468,7 @@ func (h *Handler) eventHandler(evt interface{}) {
 		}
 
 		// Debug log
-		fmt.Printf("🔍 DEBUG Message from %s - HasConversation:%v HasExtended:%v HasImage:%v HasVideo:%v HasDocument:%v HasEphemeral:%v HasViewOnce:%v\n",
+		fmt.Printf("🔍 DEBUG Message from %s - HasConversation:%v HasExtended:%v HasImage:%v HasVideo:%v HasDocument:%v HasEphemeral:%v HasViewOnce:%v HasBotInvoke:%v HasBotTask:%v HasBotForwarded:%v HasEdited:%v\n",
 			senderString,
 			v.Message.GetConversation() != "",
 			v.Message.GetExtendedTextMessage() != nil,
@@ -451,6 +477,10 @@ func (h *Handler) eventHandler(evt interface{}) {
 			v.Message.GetDocumentMessage() != nil,
 			v.Message.GetEphemeralMessage() != nil,
 			v.Message.GetViewOnceMessage() != nil,
+			v.Message.GetBotInvokeMessage() != nil,
+			v.Message.GetBotTaskMessage() != nil,
+			v.Message.GetBotForwardedMessage() != nil,
+			v.Message.GetEditedMessage() != nil,
 		)
 
 		// === Handle Text Messages ===
