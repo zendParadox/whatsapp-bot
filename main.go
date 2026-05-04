@@ -251,6 +251,11 @@ type Handler struct {
 	HTTP        *http.Client
 	Metrics     *Metrics
 	seenSenders sync.Map // set untuk track unique senders
+
+	// Meta AI streaming deduplication
+	botResponseMu     sync.Mutex
+	botResponseTimers map[string]*time.Timer   // botResponseID -> debounce timer
+	botResponseTexts  map[string]string         // botResponseID -> latest text
 }
 
 // ─────────────────────────────────────────────
@@ -338,6 +343,105 @@ func (h *Handler) eventHandler(evt interface{}) {
 		if v.Info.IsFromMe {
 			h.Metrics.MessagesIgnored.WithLabelValues("from_self").Inc()
 			return
+		}
+
+		// === Handle Meta AI Bot streaming responses ===
+		// Meta AI sends responses as ProtocolMessage(MESSAGE_EDIT) with richResponseMessage inside.
+		// It streams by editing the same message multiple times (same botResponseID, growing text).
+		// We debounce: wait 2s after last edit before processing the final complete text.
+		if proto := v.Message.GetProtocolMessage(); proto != nil {
+			if proto.GetType() == 14 { // MESSAGE_EDIT = 14
+				if editedMsg := proto.GetEditedMessage(); editedMsg != nil {
+					if richResp := editedMsg.GetRichResponseMessage(); richResp != nil {
+						// Extract text from submessages
+						var textParts []string
+						for _, sub := range richResp.GetSubmessages() {
+							if txt := sub.GetMessageText(); txt != "" {
+								textParts = append(textParts, txt)
+							}
+						}
+						if len(textParts) == 0 {
+							return
+						}
+						fullText := strings.Join(textParts, "\n")
+
+						// Get botResponseID for deduplication
+						botResponseID := ""
+						if mci := v.Message.GetMessageContextInfo(); mci != nil {
+							if bm := mci.GetBotMetadata(); bm != nil {
+								botResponseID = bm.GetBotResponseID()
+							}
+						}
+						if botResponseID == "" {
+							botResponseID = fmt.Sprintf("unknown-%d", time.Now().UnixNano())
+						}
+
+						recipientJID := v.Info.Chat.ToNonAD()
+						chatString := v.Info.Chat.ToNonAD().String()
+						senderString := v.Info.Sender.ToNonAD().String()
+						if senderString == "" || senderString == "unknown@s.whatsapp.net" {
+							senderString = chatString
+						}
+
+						fmt.Printf("🤖 [META AI STREAM] botResponseID=%s text=\"%s\"\n", botResponseID, fullText)
+
+						// Debounce: update stored text and reset 2s timer
+						h.botResponseMu.Lock()
+						h.botResponseTexts[botResponseID] = fullText
+						if existingTimer, ok := h.botResponseTimers[botResponseID]; ok {
+							existingTimer.Stop()
+						}
+						h.botResponseTimers[botResponseID] = time.AfterFunc(2*time.Second, func() {
+							h.botResponseMu.Lock()
+							finalText := h.botResponseTexts[botResponseID]
+							delete(h.botResponseTexts, botResponseID)
+							delete(h.botResponseTimers, botResponseID)
+							h.botResponseMu.Unlock()
+
+							fmt.Printf("🤖 [META AI FINAL] botResponseID=%s text=\"%s\"\n", botResponseID, finalText)
+							h.Metrics.MessagesReceived.WithLabelValues("private", "meta_ai").Inc()
+							h.Metrics.LastMsgReceivedTimestamp.SetToCurrentTime()
+
+							// Forward the Meta AI response to webhook
+							replyMessage, err := h.sendToWebhook(senderString, chatString, finalText)
+							if err != nil {
+								log.Printf("❌ Gagal memproses Meta AI response via webhook: %v\n", err)
+								replyMessage = "Maaf, terjadi kesalahan saat memproses respons AI. Coba lagi nanti."
+							}
+
+							if replyMessage != "" {
+								_, err := h.Client.SendMessage(context.Background(), recipientJID, &waProto.Message{
+									Conversation: &replyMessage,
+								})
+								if err != nil {
+									log.Printf("❌ Gagal mengirim balasan Meta AI: %v", err)
+									h.Metrics.MessagesSent.WithLabelValues("error").Inc()
+								} else {
+									fmt.Printf("✅ Balasan Meta AI terkirim ke %s\n", senderString)
+									h.Metrics.MessagesSent.WithLabelValues("success").Inc()
+									h.Metrics.LastMsgSentTimestamp.SetToCurrentTime()
+								}
+							}
+						})
+						h.botResponseMu.Unlock()
+						return
+					}
+				}
+			}
+		}
+
+		// === Handle Meta AI placeholder messages (messageContextInfo-only, no content) ===
+		if mci := v.Message.GetMessageContextInfo(); mci != nil {
+			if bm := mci.GetBotMetadata(); bm != nil {
+				// This is a bot placeholder/metadata message with no extractable content, skip it silently
+				if v.Message.GetConversation() == "" &&
+					v.Message.GetExtendedTextMessage() == nil &&
+					v.Message.GetProtocolMessage() == nil &&
+					v.Message.GetRichResponseMessage() == nil {
+					fmt.Printf("🤖 [META AI] Skipping bot placeholder message (botResponseID=%s)\n", bm.GetBotResponseID())
+					return
+				}
+			}
 		}
 
 		recipientJID := v.Info.Chat.ToNonAD()
@@ -869,6 +973,8 @@ func main() {
 		HTTP: &http.Client{
 			Timeout: 60 * time.Second,
 		},
+		botResponseTimers: make(map[string]*time.Timer),
+		botResponseTexts:  make(map[string]string),
 	}
 	client.AddEventHandler(h.eventHandler)
 
